@@ -1,6 +1,7 @@
 """This file should be imported if and only if you want to run the UI locally."""
 
 import base64
+import json
 import logging
 import time
 from collections.abc import Iterable
@@ -120,20 +121,61 @@ class PrivateGptUi:
                 yield full_response
                 time.sleep(0.02)
 
-            if completion_gen.sources:
-                full_response += SOURCES_SEPARATOR
-                cur_sources = Source.curate_sources(completion_gen.sources)
-                sources_text = "\n\n\n"
-                used_files = set()
-                for index, source in enumerate(cur_sources, start=1):
-                    if f"{source.file}-{source.page}" not in used_files:
-                        sources_text = (
-                            sources_text
-                            + f"{index}. {source.file} (page {source.page}) \n\n"
-                        )
-                        used_files.add(f"{source.file}-{source.page}")
-                sources_text += "<hr>\n\n"
-                full_response += sources_text
+            # Intentar parsear el JSON y agregar fuentes si no están
+            try:
+                start_idx = full_response.find('{')
+                if start_idx != -1:
+                    brace_count = 0
+                    end_idx = start_idx
+                    for i in range(start_idx, len(full_response)):
+                        if full_response[i] == '{':
+                            brace_count += 1
+                        elif full_response[i] == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                end_idx = i + 1
+                                break
+                    
+                    if brace_count == 0:
+                        json_str = full_response[start_idx:end_idx]
+                        parsed = json.loads(json_str)
+                        has_information = parsed.get("has_information", False)
+                        
+                        # Si hay información, asegurar que las fuentes tengan el nombre completo correcto
+                        # Solo incluir las fuentes más relevantes (mejor score), no todas las consultadas
+                        if has_information and completion_gen.sources:
+                            # Ordenar fuentes por score (mayor a menor) para obtener las más relevantes
+                            sorted_sources = sorted(
+                                completion_gen.sources,
+                                key=lambda s: s.score if hasattr(s, 'score') and s.score is not None else 0,
+                                reverse=True
+                            )
+                            
+                            # Tomar solo las top 5 fuentes más relevantes (donde realmente se encontró la información)
+                            top_sources = sorted_sources[:5]
+                            
+                            cur_sources = Source.curate_sources(top_sources)
+                            used_files = set()
+                            sources_list = []
+                            for source in cur_sources:
+                                file_key = f"{source.file}-{source.page}"
+                                if file_key not in used_files:
+                                    sources_list.append({
+                                        "archivo": source.file,  # Nombre completo del archivo desde metadata
+                                        "pagina": str(source.page)  # Asegurar que sea string
+                                    })
+                                    used_files.add(file_key)
+                            
+                            # Reemplazar las fuentes del modelo con las correctas del metadata
+                            parsed["fuentes"] = sources_list
+                            # Reconstruir el JSON con las fuentes correctas
+                            json_str = json.dumps(parsed, ensure_ascii=False, indent=2)
+                            full_response = full_response[:start_idx] + json_str + full_response[end_idx:]
+            except (json.JSONDecodeError, ValueError, AttributeError):
+                # Si no se puede parsear, dejar la respuesta como está
+                pass
+            
+            # Ya no agregamos las fuentes al final, se incluyen en el JSON
             yield full_response
 
         def yield_tokens(token_gen: TokenGen) -> Iterable[str]:
@@ -172,99 +214,286 @@ class PrivateGptUi:
                     role=MessageRole.SYSTEM,
                 ),
             )
-        match mode:
-            case Modes.RAG_MODE:
-                # Use only the selected file for the query
-                context_filter = None
-                if self._selected_filename is not None:
-                    docs_ids = []
-                    for ingested_document in self._ingest_service.list_ingested():
-                        if (
-                            ingested_document.doc_metadata["file_name"]
-                            == self._selected_filename
-                        ):
-                            docs_ids.append(ingested_document.doc_id)
-                    context_filter = ContextFilter(docs_ids=docs_ids)
+        if mode == Modes.RAG_MODE:
+            # Use priority search when no file is selected, or selected file when one is chosen
+            context_filter = None
+            
+            if self._selected_filename is not None:
+                # Archivo específico seleccionado: usar solo ese archivo
+                docs_ids = []
+                for ingested_document in self._ingest_service.list_ingested():
+                    if (
+                        ingested_document.doc_metadata
+                        and ingested_document.doc_metadata["file_name"]
+                        == self._selected_filename
+                    ):
+                        docs_ids.append(ingested_document.doc_id)
+                context_filter = ContextFilter(docs_ids=docs_ids)
+            else:
+                # Sin archivo seleccionado: usar búsqueda prioritaria
+                # Buscar primero en archivos UNEMI, luego en el resto si no encuentra
+                all_docs = self._ingest_service.list_ingested()
+                unemi_docs = [
+                    doc for doc in all_docs
+                    if doc.doc_metadata 
+                    and "unemi" in doc.doc_metadata.get("file_name", "").lower()
+                ]
+                other_docs = [
+                    doc for doc in all_docs
+                    if doc.doc_metadata 
+                    and "unemi" not in doc.doc_metadata.get("file_name", "").lower()
+                ]
+                
+                # Primero intentar con archivos UNEMI
+                if unemi_docs:
+                    unemi_ids = [doc.doc_id for doc in unemi_docs]
+                    unemi_files = [doc.doc_metadata.get("file_name", "Unknown") if doc.doc_metadata else "Unknown" for doc in unemi_docs]
+                    logger.info(f"🔍 BÚSQUEDA PRIORITARIA - Archivos UNEMI encontrados: {len(unemi_docs)}")
+                    logger.info(f"📄 Archivos UNEMI: {unemi_files}")
+                    context_filter = ContextFilter(docs_ids=unemi_ids)
+                    
+                    # Hacer búsqueda NO-STREAMING primero para verificar relevancia
+                    logger.info(f"🔎 Buscando en archivos UNEMI...")
+                    completion_unemi = self._chat_service.chat(
+                        messages=all_messages,
+                        use_context=True,
+                        context_filter=context_filter,
+                    )
+                    
+                    # Verificar si la respuesta es relevante usando JSON parsing
+                    response_text = completion_unemi.response if completion_unemi.response else ""
+                    has_sources = completion_unemi.sources and len(completion_unemi.sources) > 0
+                    
+                    # Parsear respuesta JSON para obtener has_information
+                    import json
+                    has_information = False
+                    clean_response = response_text
+                    
+                    try:
+                        # Buscar el inicio del JSON (primer {)
+                        start_idx = response_text.find('{')
+                        if start_idx != -1:
+                            # Buscar el final del JSON balanceando las llaves
+                            brace_count = 0
+                            end_idx = start_idx
+                            for i in range(start_idx, len(response_text)):
+                                if response_text[i] == '{':
+                                    brace_count += 1
+                                elif response_text[i] == '}':
+                                    brace_count -= 1
+                                    if brace_count == 0:
+                                        end_idx = i + 1
+                                        break
+                            
+                            if brace_count == 0:
+                                json_str = response_text[start_idx:end_idx]
+                                parsed = json.loads(json_str)
+                                has_information = parsed.get("has_information", False)
+                                # Si has_information es false, puede que no haya campo "response"
+                                clean_response = parsed.get("response")
+                                if clean_response is None and has_information:
+                                    clean_response = response_text
+                                elif clean_response is None:
+                                    clean_response = ""
+                                
+                                # Si hay información y hay sources, asegurar que las fuentes tengan el nombre completo correcto
+                                # Solo incluir las fuentes más relevantes (mejor score), no todas las consultadas
+                                if has_information and completion_unemi.sources:
+                                    # Ordenar fuentes por score (mayor a menor) para obtener las más relevantes
+                                    sorted_sources = sorted(
+                                        completion_unemi.sources,
+                                        key=lambda s: s.score if hasattr(s, 'score') and s.score is not None else 0,
+                                        reverse=True
+                                    )
+                                    
+                                    # Tomar solo las top 5 fuentes más relevantes (donde realmente se encontró la información)
+                                    top_sources = sorted_sources[:5]
+                                    
+                                    # Extraer fuentes únicas del metadata (nombre completo del archivo)
+                                    cur_sources = Source.curate_sources(top_sources)
+                                    used_files = set()
+                                    sources_list = []
+                                    for source in cur_sources:
+                                        file_key = f"{source.file}-{source.page}"
+                                        if file_key not in used_files:
+                                            sources_list.append({
+                                                "archivo": source.file,  # Nombre completo del archivo desde metadata
+                                                "pagina": str(source.page)  # Asegurar que sea string
+                                            })
+                                            used_files.add(file_key)
+                                    # Reemplazar las fuentes del modelo con las correctas del metadata
+                                    parsed["fuentes"] = sources_list
+                                    # Reconstruir el JSON con las fuentes correctas
+                                    json_str = json.dumps(parsed, ensure_ascii=False)
+                                    # Reemplazar el JSON original en response_text
+                                    response_text = response_text[:start_idx] + json_str + response_text[end_idx:]
+                                    clean_response = parsed.get("response", "")
+                    except (json.JSONDecodeError, ValueError, AttributeError):
+                        # Si no puede parsear, usar lógica de fallback
+                        no_info_phrases = [
+                            "no se encuentra", "no está en el contexto", "no hay información"
+                        ]
+                        has_information = not any(phrase in response_text.lower() for phrase in no_info_phrases)
+                    
+                    # Si es relevante, retornar solo UNEMI
+                    # Reducido el umbral mínimo de longitud para ser más tolerante a errores ortográficos
+                    logger.info(f"✅ Resultado búsqueda UNEMI: has_sources={has_sources}, has_information={has_information}, length={len(clean_response)}")
+                    if has_sources and has_information and len(clean_response) >= 30:
+                        logger.info(f"✅ Información encontrada en UNEMI. Retornando respuesta.")
+                        # Si tenemos un JSON parseado con fuentes, mostrarlo directamente
+                        parsed_json = None
+                        try:
+                            # Intentar parsear response_text para obtener el JSON completo
+                            start_idx = response_text.find('{')
+                            if start_idx != -1:
+                                brace_count = 0
+                                end_idx = start_idx
+                                for i in range(start_idx, len(response_text)):
+                                    if response_text[i] == '{':
+                                        brace_count += 1
+                                    elif response_text[i] == '}':
+                                        brace_count -= 1
+                                        if brace_count == 0:
+                                            end_idx = i + 1
+                                            break
+                                if brace_count == 0:
+                                    json_str = response_text[start_idx:end_idx]
+                                    parsed_json = json.loads(json_str)
+                        except (json.JSONDecodeError, ValueError, AttributeError):
+                            pass
+                        
+                        if parsed_json and parsed_json.get("fuentes"):
+                            # Mostrar el JSON completo con fuentes
+                            json_with_sources = json.dumps(parsed_json, ensure_ascii=False, indent=2)
+                            yield json_with_sources
+                        else:
+                            # Convertir a streaming para mantener consistencia
+                            query_stream = self._chat_service.stream_chat(
+                                messages=all_messages,
+                                use_context=True,
+                                context_filter=context_filter,
+                            )
+                            yield from yield_deltas(query_stream)
+                    elif other_docs:
+                        # No es relevante, buscar en otros documentos
+                        other_ids = [doc.doc_id for doc in other_docs]
+                        other_files = [doc.doc_metadata.get("file_name", "Unknown") if doc.doc_metadata else "Unknown" for doc in other_docs]
+                        logger.info(f"⚠️ No se encontró información relevante en UNEMI. Haciendo fallback...")
+                        logger.info(f"📄 Archivos para fallback: {other_files}")
+                        context_filter_other = ContextFilter(docs_ids=other_ids)
+                        
+                        try:
+                            query_stream_other = self._chat_service.stream_chat(
+                                messages=all_messages,
+                                use_context=True,
+                                context_filter=context_filter_other,
+                            )
+                            yield from yield_deltas(query_stream_other)
+                        except Exception as e:
+                            # Si hay error (ej: vector None), usar UNEMI de todas formas
+                            import logging
+                            logging.getLogger(__name__).warning(f"Error en búsqueda otros documentos: {e}")
+                            query_stream = self._chat_service.stream_chat(
+                                messages=all_messages,
+                                use_context=True,
+                                context_filter=context_filter,
+                            )
+                            yield from yield_deltas(query_stream)
+                    else:
+                        # No hay otros documentos, retornar lo de UNEMI aunque no sea perfecto
+                        query_stream = self._chat_service.stream_chat(
+                            messages=all_messages,
+                            use_context=True,
+                            context_filter=context_filter,
+                        )
+                        yield from yield_deltas(query_stream)
+                else:
+                    # No hay archivos UNEMI, buscar en todos
+                    query_stream = self._chat_service.stream_chat(
+                        messages=all_messages,
+                        use_context=True,
+                        context_filter=None,
+                    )
+                    yield from yield_deltas(query_stream)
+                return
 
-                query_stream = self._chat_service.stream_chat(
-                    messages=all_messages,
-                    use_context=True,
-                    context_filter=context_filter,
-                )
-                yield from yield_deltas(query_stream)
-            case Modes.BASIC_CHAT_MODE:
-                llm_stream = self._chat_service.stream_chat(
-                    messages=all_messages,
-                    use_context=False,
-                )
-                yield from yield_deltas(llm_stream)
+            # Si hay archivo seleccionado, usar búsqueda normal
+            query_stream = self._chat_service.stream_chat(
+                messages=all_messages,
+                use_context=True,
+                context_filter=context_filter,
+            )
+            yield from yield_deltas(query_stream)
+        elif mode == Modes.BASIC_CHAT_MODE:
+            llm_stream = self._chat_service.stream_chat(
+                messages=all_messages,
+                use_context=False,
+            )
+            yield from yield_deltas(llm_stream)
+        elif mode == Modes.SEARCH_MODE:
+            response = self._chunks_service.retrieve_relevant(
+                text=message, limit=4, prev_next_chunks=0
+            )
 
-            case Modes.SEARCH_MODE:
-                response = self._chunks_service.retrieve_relevant(
-                    text=message, limit=4, prev_next_chunks=0
-                )
+            sources = Source.curate_sources(response)
 
-                sources = Source.curate_sources(response)
+            yield "\n\n\n".join(
+                f"{index}. **{source.file} "
+                f"(page {source.page})**\n "
+                f"{source.text}"
+                for index, source in enumerate(sources, start=1)
+            )
+        elif mode == Modes.SUMMARIZE_MODE:
+            # Summarize the given message, optionally using selected files
+            context_filter = None
+            if self._selected_filename:
+                docs_ids = []
+                for ingested_document in self._ingest_service.list_ingested():
+                    if (
+                        ingested_document.doc_metadata["file_name"]
+                        == self._selected_filename
+                    ):
+                        docs_ids.append(ingested_document.doc_id)
+                context_filter = ContextFilter(docs_ids=docs_ids)
 
-                yield "\n\n\n".join(
-                    f"{index}. **{source.file} "
-                    f"(page {source.page})**\n "
-                    f"{source.text}"
-                    for index, source in enumerate(sources, start=1)
-                )
-            case Modes.SUMMARIZE_MODE:
-                # Summarize the given message, optionally using selected files
-                context_filter = None
-                if self._selected_filename:
-                    docs_ids = []
-                    for ingested_document in self._ingest_service.list_ingested():
-                        if (
-                            ingested_document.doc_metadata["file_name"]
-                            == self._selected_filename
-                        ):
-                            docs_ids.append(ingested_document.doc_id)
-                    context_filter = ContextFilter(docs_ids=docs_ids)
-
-                summary_stream = self._summarize_service.stream_summarize(
-                    use_context=True,
-                    context_filter=context_filter,
-                    instructions=message,
-                )
-                yield from yield_tokens(summary_stream)
+            summary_stream = self._summarize_service.stream_summarize(
+                use_context=True,
+                context_filter=context_filter,
+                instructions=message,
+            )
+            yield from yield_tokens(summary_stream)
 
     # On initialization and on mode change, this function set the system prompt
     # to the default prompt based on the mode (and user settings).
     @staticmethod
     def _get_default_system_prompt(mode: Modes) -> str:
         p = ""
-        match mode:
-            # For query chat mode, obtain default system prompt from settings
-            case Modes.RAG_MODE:
-                p = settings().ui.default_query_system_prompt
-            # For chat mode, obtain default system prompt from settings
-            case Modes.BASIC_CHAT_MODE:
-                p = settings().ui.default_chat_system_prompt
-            # For summarization mode, obtain default system prompt from settings
-            case Modes.SUMMARIZE_MODE:
-                p = settings().ui.default_summarization_system_prompt
-            # For any other mode, clear the system prompt
-            case _:
-                p = ""
+        # For query chat mode, obtain default system prompt from settings
+        if mode == Modes.RAG_MODE:
+            p = settings().ui.default_query_system_prompt
+        # For chat mode, obtain default system prompt from settings
+        elif mode == Modes.BASIC_CHAT_MODE:
+            p = settings().ui.default_chat_system_prompt
+        # For summarization mode, obtain default system prompt from settings
+        elif mode == Modes.SUMMARIZE_MODE:
+            p = settings().ui.default_summarization_system_prompt
+        # For any other mode, clear the system prompt
+        else:
+            p = ""
         return p
 
     @staticmethod
     def _get_default_mode_explanation(mode: Modes) -> str:
-        match mode:
-            case Modes.RAG_MODE:
-                return "Get contextualized answers from selected files."
-            case Modes.SEARCH_MODE:
-                return "Find relevant chunks of text in selected files."
-            case Modes.BASIC_CHAT_MODE:
-                return "Chat with the LLM using its training data. Files are ignored."
-            case Modes.SUMMARIZE_MODE:
-                return "Generate a summary of the selected files. Prompt to customize the result."
-            case _:
-                return ""
+        if mode == Modes.RAG_MODE:
+            return "Get contextualized answers from selected files."
+        elif mode == Modes.SEARCH_MODE:
+            return "Find relevant chunks of text in selected files."
+        elif mode == Modes.BASIC_CHAT_MODE:
+            return "Chat with the LLM using its training data. Files are ignored."
+        elif mode == Modes.SUMMARIZE_MODE:
+            return "Generate a summary of the selected files. Prompt to customize the result."
+        else:
+            return ""
 
     def _set_system_prompt(self, system_prompt_input: str) -> None:
         logger.info(f"Setting system prompt to: {system_prompt_input}")
@@ -347,12 +576,77 @@ class PrivateGptUi:
             gr.components.Textbox("All files"),
         ]
 
+    def _rename_selected_file(self, new_name: str) -> Any:
+        """Rename the selected file."""
+        if not self._selected_filename:
+            return [
+                gr.components.Textbox(visible=False),
+                gr.components.Button(visible=False),
+                gr.components.Button(visible=False),
+                gr.List(self._list_ingested_files()),
+                gr.components.Textbox("All files"),
+            ]
+        
+        if not new_name or new_name.strip() == "":
+            return [
+                gr.components.Textbox(visible=False),
+                gr.components.Button(visible=False),
+                gr.components.Button(visible=False),
+                gr.List(self._list_ingested_files()),
+                gr.components.Textbox(self._selected_filename),
+            ]
+        
+        new_name = new_name.strip()
+        logger.info("Renaming file from '%s' to '%s'", self._selected_filename, new_name)
+        
+        renamed_count = 0
+        try:
+            renamed_count = self._ingest_service.rename_file(
+                self._selected_filename, new_name
+            )
+            if renamed_count > 0:
+                self._selected_filename = new_name
+                logger.info("Successfully renamed %s documents", renamed_count)
+            else:
+                logger.warning("No documents were renamed")
+        except Exception as e:
+            logger.error("Failed to rename file: %s", str(e))
+        
+        return [
+            gr.components.Textbox(visible=False),
+            gr.components.Button(visible=False),
+            gr.components.Button(visible=False),
+            gr.List(self._list_ingested_files()),
+            gr.components.Textbox(self._selected_filename if renamed_count > 0 else "All files"),
+        ]
+
+    def _show_rename_dialog(self) -> Any:
+        """Show the rename dialog."""
+        if not self._selected_filename:
+            return [
+                gr.components.Textbox(visible=False),
+                gr.components.Button(visible=False),
+                gr.components.Button(visible=False),
+            ]
+        
+        return [
+            gr.components.Textbox(
+                value=self._selected_filename,
+                label="Nuevo nombre del archivo",
+                visible=True,
+                interactive=True,
+            ),
+            gr.components.Button("✅ Guardar", visible=True, variant="primary"),
+            gr.components.Button("❌ Cancelar", visible=True),
+        ]
+
     def _deselect_selected_file(self) -> Any:
         self._selected_filename = None
         return [
             gr.components.Button(interactive=False),
             gr.components.Button(interactive=False),
             gr.components.Textbox("All files"),
+            gr.components.Button(interactive=False),
         ]
 
     def _selected_a_file(self, select_data: gr.SelectData) -> Any:
@@ -361,6 +655,7 @@ class PrivateGptUi:
             gr.components.Button(interactive=True),
             gr.components.Button(interactive=True),
             gr.components.Textbox(self._selected_filename),
+            gr.components.Button(interactive=True),
         ]
 
     def _build_ui_blocks(self) -> gr.Blocks:
@@ -430,12 +725,35 @@ class PrivateGptUi:
                         outputs=ingested_dataset,
                     )
                     ingested_dataset.render()
-                    deselect_file_button = gr.components.Button(
-                        "De-select selected file", size="sm", interactive=False
-                    )
                     selected_text = gr.components.Textbox(
                         "All files", label="Selected for Query or Deletion", max_lines=1
                     )
+                    deselect_file_button = gr.components.Button(
+                        "De-select selected file", size="sm", interactive=False
+                    )
+                    rename_file_button = gr.components.Button(
+                        "✏️ Rename selected file",
+                        size="sm",
+                        interactive=False,
+                        visible=True,
+                    )
+                    rename_input = gr.components.Textbox(
+                        label="Nuevo nombre del archivo",
+                        visible=False,
+                        interactive=True,
+                    )
+                    with gr.Row():
+                        save_rename_button = gr.components.Button(
+                            "✅ Guardar",
+                            size="sm",
+                            visible=False,
+                            variant="primary",
+                        )
+                        cancel_rename_button = gr.components.Button(
+                            "❌ Cancelar",
+                            size="sm",
+                            visible=False,
+                        )
                     delete_file_button = gr.components.Button(
                         "🗑️ Delete selected file",
                         size="sm",
@@ -453,6 +771,7 @@ class PrivateGptUi:
                             delete_file_button,
                             deselect_file_button,
                             selected_text,
+                            rename_file_button,
                         ],
                     )
                     ingested_dataset.select(
@@ -461,6 +780,38 @@ class PrivateGptUi:
                             delete_file_button,
                             deselect_file_button,
                             selected_text,
+                            rename_file_button,
+                        ],
+                    )
+                    rename_file_button.click(
+                        fn=self._show_rename_dialog,
+                        outputs=[
+                            rename_input,
+                            save_rename_button,
+                            cancel_rename_button,
+                        ],
+                    )
+                    save_rename_button.click(
+                        fn=self._rename_selected_file,
+                        inputs=rename_input,
+                        outputs=[
+                            rename_input,
+                            save_rename_button,
+                            cancel_rename_button,
+                            ingested_dataset,
+                            selected_text,
+                        ],
+                    )
+                    cancel_rename_button.click(
+                        fn=lambda: [
+                            gr.components.Textbox(visible=False),
+                            gr.components.Button(visible=False),
+                            gr.components.Button(visible=False),
+                        ],
+                        outputs=[
+                            rename_input,
+                            save_rename_button,
+                            cancel_rename_button,
                         ],
                     )
                     delete_file_button.click(

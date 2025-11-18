@@ -22,15 +22,40 @@ services:
       PGPT_MODE: ollama
       PGPT_EMBED_MODE: ollama
       PGPT_OLLAMA_API_BASE: http://ollama:11434
+      PGPT_OLLAMA_LLM_MODEL: ${PGPT_OLLAMA_LLM_MODEL:-}
       HF_TOKEN: ${HF_TOKEN:-}
     profiles:
-      - ""
       - ollama-cpu
       - ollama-cuda
       - ollama-api
     depends_on:
       ollama:
         condition: service_healthy
+
+  # Private-GPT service for Gemini API
+  # This service uses Gemini API for faster responses
+  private-gpt-gemini:
+    image: ${PGPT_IMAGE:-zylonai/private-gpt}:${PGPT_TAG:-0.6.2}-ollama  # x-release-please-version
+    user: root
+    build:
+      context: .
+      dockerfile: Dockerfile.ollama
+    volumes:
+      - ./local_data:/home/worker/app/local_data
+    ports:
+      - "8001:8001"
+    environment:
+      PORT: 8001
+      PGPT_PROFILES: docker
+      PGPT_MODE: gemini
+      PGPT_EMBED_MODE: huggingface
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      PGPT_GEMINI_MODEL: ${PGPT_GEMINI_MODEL:-}
+      PGPT_EMBEDDING_HF_MODEL_NAME: ${PGPT_EMBEDDING_HF_MODEL_NAME:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+    profiles:
+      - ""
+      - gemini
 
   # Private-GPT service for the local mode
   # This service builds from a local Dockerfile and runs the application in local mode.

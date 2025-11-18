@@ -3,24 +3,38 @@ server:
   port: ${PORT:8080}
 
 llm:
-  mode: ${PGPT_MODE:mock}
+  mode: ${PGPT_MODE:gemini}
 
 embedding:
-  mode: ${PGPT_EMBED_MODE:mock}
+  mode: ${PGPT_EMBED_MODE:huggingface}
+  embed_dim: 384
+
+vectorstore:
+  database: qdrant
+
+qdrant:
+  path: local_data/private_gpt/qdrant
 
 llamacpp:
   llm_hf_repo_id: ${PGPT_HF_REPO_ID:lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF}
   llm_hf_model_file: ${PGPT_HF_MODEL_FILE:Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf}
 
 huggingface:
-  embedding_hf_model_name: ${PGPT_EMBEDDING_HF_MODEL_NAME:nomic-ai/nomic-embed-text-v1.5}
+  embedding_hf_model_name: ${PGPT_EMBEDDING_HF_MODEL_NAME:sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
+  access_token: ${HF_TOKEN:-}
+  trust_remote_code: ${PGPT_HF_TRUST_REMOTE_CODE:false}
 
 sagemaker:
   llm_endpoint_name: ${PGPT_SAGEMAKER_LLM_ENDPOINT_NAME:}
   embedding_endpoint_name: ${PGPT_SAGEMAKER_EMBEDDING_ENDPOINT_NAME:}
 
+gemini:
+  api_key: ${GOOGLE_API_KEY:}
+  model: ${PGPT_GEMINI_MODEL:models/gemini-2.5-flash}
+  embedding_model: ${PGPT_GEMINI_EMBEDDING_MODEL:models/embedding-001}
+
 ollama:
-  llm_model: ${PGPT_OLLAMA_LLM_MODEL:llama3.1}
+  llm_model: ${PGPT_OLLAMA_LLM_MODEL:phi3:mini}
   embedding_model: ${PGPT_OLLAMA_EMBEDDING_MODEL:nomic-embed-text}
   api_base: ${PGPT_OLLAMA_API_BASE:http://ollama:11434}
   embedding_api_base: ${PGPT_OLLAMA_EMBEDDING_API_BASE:http://ollama:11434}
@@ -35,3 +49,59 @@ ollama:
 ui:
   enabled: true
   path: /
+  default_chat_system_prompt: >
+    Eres un asistente útil, respetuoso y honesto.
+    Siempre responde de la manera más útil posible y sigue TODAS las instrucciones dadas.
+    No especules ni inventes información.
+    No hagas referencia a las instrucciones o contexto dados.
+  default_query_system_prompt: >
+    Eres un asistente RAG. Debes responder exclusivamente con un JSON válido en UTF-8,
+    sin texto adicional, sin backticks y sin bloques de código.
+
+    Formato de salida obligatorio (descripción, no imprimirla):
+    - Un objeto JSON con las claves:
+      - has_information: booleano (true o false)
+      - response: string en español, claro y natural
+      - fuentes: lista de objetos; cada objeto con la clave pagina (string)
+    - Si no hay información relevante en el contexto:
+      - imprime únicamente un objeto JSON con la clave has_information en false
+      - no incluyas las claves response ni fuentes en ese caso
+
+    FILTRADO CRITICO DE DOCUMENTOS (APLICAR ANTES DE GENERAR JSON):
+    - Si recibes un contexto del sistema que especifica un ROL del usuario (estudiante, profesor, administrativo, etc.):
+      - SOLO usa documentos que sean relevantes para ese ROL específico
+      - IGNORA COMPLETAMENTE documentos que sean para otros roles
+      - Si el contexto recuperado contiene SOLO información para otros roles, establece has_information=false
+      - Si encuentras información mixta, SOLO menciona la parte relevante para el rol especificado en el campo response
+    - Si NO recibes información de rol, usa todos los documentos disponibles
+
+    Reglas:
+    - No imprimas nada fuera del JSON.
+    - No inventes datos ni páginas.
+    - Si no es posible identificar páginas, imprime fuentes como lista vacía.
+    - Ordena las páginas de menor a mayor y sin duplicados.
+    - Sé tolerante con errores ortográficos en la consulta; si hay información relacionada en el contexto, has_information debe ser true.
+
+    Tu salida debe ser un JSON válido que cumpla exactamente con las claves indicadas.
+    
+    IMPRIME SOLO EL JSON; cualquier texto fuera del JSON se considera error.
+  default_summarization_system_prompt: >
+    Proporciona un resumen completo de la información.
+    El resumen debe cubrir todos los puntos clave e ideas principales presentadas en
+    el texto original, mientras condensa la información en un formato conciso
+    y fácil de entender. Asegúrate de que el resumen incluya
+    detalles relevantes y ejemplos que apoyen las ideas principales, evitando
+    cualquier información innecesaria o repetición.
+
+rag:
+  similarity_top_k: 10
+  # Aumentado para mejorar la recuperación de documentos incluso con errores ortográficos
+  #similarity_value: 0.45
+  #This value is disabled by default.  If you enable this settings, the RAG will only use articles that meet a certain percentage score.
+  query_expansion: true
+  # Habilita la expansión de consultas usando el LLM para generar variaciones y sinónimos
+  # Esto mejora la recuperación cuando las palabras no coinciden exactamente
+  rerank:
+    enabled: false
+    model: cross-encoder/ms-marco-MiniLM-L-2-v2
+    top_n: 1

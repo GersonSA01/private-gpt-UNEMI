@@ -102,3 +102,41 @@ def delete_ingested(request: Request, doc_id: str) -> None:
     """
     service = request.state.injector.get(IngestService)
     service.delete(doc_id)
+
+
+class RenameFileBody(BaseModel):
+    old_name: str = Field(description="Current file name to rename")
+    new_name: str = Field(description="New file name")
+
+
+class RenameFileResponse(BaseModel):
+    renamed_count: int = Field(description="Number of documents renamed")
+    message: str
+
+
+@ingest_router.post("/ingest/rename", tags=["Ingestion"])
+def rename_file(request: Request, body: RenameFileBody) -> RenameFileResponse:
+    """Rename all documents with a given file name.
+    
+    This endpoint updates the file_name metadata for all documents that match
+    the old_name. This is useful for organizing files for priority search.
+    
+    For example, if you want to add "unemi" to a file name so it gets prioritized:
+    - old_name: "REGLAMENTO-FACULTADES.pdf"
+    - new_name: "UNEMI-REGLAMENTO-FACULTADES.pdf"
+    
+    All documents with the old name will be updated to the new name.
+    """
+    service = request.state.injector.get(IngestService)
+    renamed_count = service.rename_file(body.old_name, body.new_name)
+    
+    if renamed_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No documents found with file name '{body.old_name}'"
+        )
+    
+    return RenameFileResponse(
+        renamed_count=renamed_count,
+        message=f"Successfully renamed {renamed_count} document(s) from '{body.old_name}' to '{body.new_name}'"
+    )

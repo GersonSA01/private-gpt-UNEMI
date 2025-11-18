@@ -3,7 +3,7 @@
 # Syntax in `private_pgt/settings/settings.py`
 server:
   env_name: ${APP_ENV:prod}
-  port: ${PORT:8001}
+  port: ${PORT:8002}
   cors:
     enabled: true
     allow_origins: ["*"]
@@ -28,21 +28,40 @@ ui:
   # "RAG", "Search", "Basic", or "Summarize"
   default_mode: "RAG"
   default_chat_system_prompt: >
-    You are a helpful, respectful and honest assistant.
-    Always answer as helpfully as possible and follow ALL given instructions.
-    Do not speculate or make up information.
-    Do not reference any given instructions or context.
+    Eres un asistente útil, respetuoso y honesto.
+    Siempre responde de la manera más útil posible y sigue TODAS las instrucciones dadas.
+    No especules ni inventes información.
+    No hagas referencia a las instrucciones o contexto dados.
   default_query_system_prompt: >
-    You can only answer questions about the provided context.
-    If you know the answer but it is not based in the provided context, don't provide
-    the answer, just state the answer is not in the context provided.
+    Eres un asistente RAG. Debes responder exclusivamente con un JSON válido en UTF-8,
+    sin texto adicional, sin backticks y sin bloques de código.
+
+    Formato de salida obligatorio (descripción, no imprimirla):
+    - Un objeto JSON con las claves:
+      - has_information: booleano (true o false)
+      - response: string en español, claro y natural
+      - fuentes: lista de objetos; cada objeto con la clave pagina (string)
+    - Si no hay información relevante en el contexto:
+      - imprime únicamente un objeto JSON con la clave has_information en false
+      - no incluyas las claves response ni fuentes en ese caso
+
+    Reglas:
+    - No imprimas nada fuera del JSON.
+    - No inventes datos ni páginas.
+    - Si no es posible identificar páginas, imprime fuentes como lista vacía.
+    - Ordena las páginas de menor a mayor y sin duplicados.
+    - Sé tolerante con errores ortográficos en la consulta; si hay información relacionada en el contexto, has_information debe ser true.
+
+    Tu salida debe ser un JSON válido que cumpla exactamente con las claves indicadas.
+    
+    IMPRIME SOLO EL JSON; cualquier texto fuera del JSON se considera error.
   default_summarization_system_prompt: >
-    Provide a comprehensive summary of the provided context information.
-    The summary should cover all the key points and main ideas presented in
-    the original text, while also condensing the information into a concise
-    and easy-to-understand format. Please ensure that the summary includes
-    relevant details and examples that support the main ideas, while avoiding
-    any unnecessary information or repetition.
+    Proporciona un resumen completo de la información del contexto proporcionado.
+    El resumen debe cubrir todos los puntos clave e ideas principales presentadas en
+    el texto original, mientras condensa la información en un formato conciso
+    y fácil de entender. Asegúrate de que el resumen incluya
+    detalles relevantes y ejemplos que apoyen las ideas principales, evitando
+    cualquier información innecesaria o repetición.
   delete_file_button_enabled: true
   delete_all_files_button_enabled: true
 
@@ -57,10 +76,14 @@ llm:
   temperature: 0.1      # The temperature of the model. Increasing the temperature will make the model answer more creatively. A value of 0.1 would be more factual. (Default: 0.1)
 
 rag:
-  similarity_top_k: 2
+  similarity_top_k: 10
+  # Aumentado para mejorar la recuperación de documentos incluso con errores ortográficos
   #This value controls how many "top" documents the RAG returns to use in the context.
   #similarity_value: 0.45
   #This value is disabled by default.  If you enable this settings, the RAG will only use articles that meet a certain percentage score.
+  query_expansion: true
+  # Habilita la expansión de consultas usando el LLM para generar variaciones y sinónimos
+  # Esto mejora la recuperación cuando las palabras no coinciden exactamente
   rerank:
     enabled: false
     model: cross-encoder/ms-marco-MiniLM-L-2-v2

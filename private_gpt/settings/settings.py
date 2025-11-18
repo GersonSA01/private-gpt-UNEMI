@@ -404,6 +404,10 @@ class RagSettings(BaseModel):
         None,
         description="If set, any documents retrieved from the RAG must meet a certain match score. Acceptable values are between 0 and 1.",
     )
+    query_expansion: bool = Field(
+        True,
+        description="If enabled, uses LLM to expand queries with synonyms and variations before searching, improving retrieval when words don't match exactly.",
+    )
     rerank: RerankSettings
 
 

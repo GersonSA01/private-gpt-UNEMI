@@ -201,16 +201,43 @@ class VectorStoreComponent:
         similarity_top_k: int = 2,
     ) -> VectorIndexRetriever:
         # This way we support qdrant (using doc_ids) and the rest (using filters)
-        return VectorIndexRetriever(
+        base_filters = (
+            _doc_id_metadata_filter(context_filter)
+            if self.settings.vectorstore.database != "qdrant"
+            else None
+        )
+        
+        # Crear un retriever wrapper que filtre archivos temporales
+        retriever = VectorIndexRetriever(
             index=index,
             similarity_top_k=similarity_top_k,
             doc_ids=context_filter.docs_ids if context_filter else None,
-            filters=(
-                _doc_id_metadata_filter(context_filter)
-                if self.settings.vectorstore.database != "qdrant"
-                else None
-            ),
+            filters=base_filters,
         )
+        
+        # Wrapper para filtrar archivos tmp
+        class FilteredRetriever:
+            def __init__(self, base_retriever):
+                self.base_retriever = base_retriever
+                self.similarity_top_k = base_retriever.similarity_top_k
+            
+            def retrieve(self, query_bundle):
+                nodes = self.base_retriever.retrieve(query_bundle)
+                # Filtrar nodos de archivos temporales
+                filtered_nodes = []
+                for node in nodes:
+                    node_metadata = getattr(node.node, 'metadata', {}) if hasattr(node, 'node') else {}
+                    file_name = node_metadata.get('file_name', '')
+                    if not file_name.lower().startswith('tmp'):
+                        filtered_nodes.append(node)
+                    else:
+                        logger.debug(f"Filtrando archivo temporal de resultados RAG: {file_name}")
+                return filtered_nodes
+            
+            def __getattr__(self, name):
+                return getattr(self.base_retriever, name)
+        
+        return FilteredRetriever(retriever)
 
     def close(self) -> None:
         if hasattr(self.vector_store.client, "close"):
